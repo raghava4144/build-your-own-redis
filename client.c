@@ -1,10 +1,8 @@
 // client.c
 //
-// Commit 2: send several requests over ONE connection, using the same
-// [4-byte length][payload] protocol as the server.
-//
-// This proves the server's new loop actually works - Commit 1's server
-// would've only handled the first message and ignored the rest.
+// Sends several requests over ONE connection, using the [4-byte
+// length][payload] protocol. Blocking client - the server is what got the
+// event loop upgrade in Commit 3, the client doesn't need one for our tests.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,14 +47,12 @@ static int32_t write_all(int fd, const char *buf, size_t n) {
     return 0;
 }
 
-// Send one request, wait for the matching reply, print it.
 static int32_t query(int fd, const char *text) {
     uint32_t len = (uint32_t)strlen(text);
     if (len > k_max_msg) {
         return -1;
     }
 
-    // build and send [len][payload]
     char wbuf[4 + k_max_msg];
     memcpy(wbuf, &len, 4);
     memcpy(&wbuf[4], text, len);
@@ -64,7 +60,6 @@ static int32_t query(int fd, const char *text) {
         return -1;
     }
 
-    // read the reply header
     char rbuf[4 + k_max_msg];
     errno = 0;
     if (read_full(fd, rbuf, 4) != 0) {
@@ -79,7 +74,6 @@ static int32_t query(int fd, const char *text) {
         return -1;
     }
 
-    // read the reply body
     if (read_full(fd, &rbuf[4], reply_len) != 0) {
         msg("read() error while reading reply body");
         return -1;
@@ -89,7 +83,7 @@ static int32_t query(int fd, const char *text) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         die("socket()");
@@ -104,10 +98,16 @@ int main(void) {
         die("connect()");
     }
 
-    // Three separate requests, ONE connection. Commit 1 could not have
-    // done this - it only ever handled a single exchange.
-    const char *messages[] = {"hello1", "hello2", "hello3"};
-    for (size_t i = 0; i < sizeof(messages) / sizeof(messages[0]); i++) {
+    // Allow passing a custom "tag" via argv so we can tell apart the output
+    // of two clients running at the same time (used for testing Commit 3).
+    const char *tag = (argc > 1) ? argv[1] : "";
+
+    char messages[3][64];
+    snprintf(messages[0], sizeof(messages[0]), "%shello1", tag);
+    snprintf(messages[1], sizeof(messages[1]), "%shello2", tag);
+    snprintf(messages[2], sizeof(messages[2]), "%shello3", tag);
+
+    for (size_t i = 0; i < 3; i++) {
         if (query(fd, messages[i]) != 0) {
             break;
         }
