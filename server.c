@@ -38,6 +38,15 @@ static void die(const char *m) {
 }
 
 const size_t k_max_msg = 4096;
+const size_t k_max_args = 16;      // max strings in one command
+
+// NOTE: this one has to be a real preprocessor #define, not `const size_t`
+// like the others above. In C (unlike C++), a file-scope `const` is not a
+// true compile-time constant, so it can't be used to size a global array
+// like g_store below - the compiler rejects it as "variably modified at
+// file scope". #define sidesteps this because it's a textual substitution
+// that happens before compilation even starts.
+#define K_MAX_ENTRIES 1024
 
 // ---------------------------------------------------------------------
 // Buffer: a small growable byte array, since plain C doesn't give us
@@ -92,6 +101,197 @@ static void buf_consume(Buffer *b, size_t n) {
     }
     memmove(b->data, b->data + n, b->size - n);
     b->size -= n;
+}
+
+// ---------------------------------------------------------------------
+// The data store (Commit 4 placeholder version)
+//
+// This is a deliberately dumb, linear-scan key/value table. Every get/set/
+// del walks the whole array comparing keys one at a time - O(N) per
+// operation. That's fine for a handful of keys, and it's genuinely useful
+// as a first version: it's easy to verify by inspection that it's correct.
+// The NEXT commit replaces this with a real hashtable, and you'll be able
+// to directly feel why that matters once you've got more than a few dozen
+// keys in here. Keeping this version around in git history is the point -
+// it's a real before/after for a resume story about Big-O in practice.
+// ---------------------------------------------------------------------
+typedef struct {
+    bool used;
+    char *key;
+    size_t key_len;
+    char *val;
+    size_t val_len;
+} Entry;
+
+static Entry g_store[K_MAX_ENTRIES];
+
+// Returns the index of the entry with this key, or -1 if not found.
+static int store_find(const uint8_t *key, size_t key_len) {
+    for (size_t i = 0; i < K_MAX_ENTRIES; i++) {
+        if (g_store[i].used
+            && g_store[i].key_len == key_len
+            && memcmp(g_store[i].key, key, key_len) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Insert or overwrite a key. Returns 0 on success, -1 if the store is full
+// and this is a brand new key (updates to existing keys always succeed).
+static int store_set(const uint8_t *key, size_t key_len,
+                      const uint8_t *val, size_t val_len) {
+    int idx = store_find(key, key_len);
+    if (idx < 0) {
+        // find an empty slot for a new key
+        for (size_t i = 0; i < K_MAX_ENTRIES; i++) {
+            if (!g_store[i].used) {
+                idx = (int)i;
+                break;
+            }
+        }
+        if (idx < 0) {
+            return -1;  // store is full - a real limitation of this version
+        }
+        g_store[idx].used = true;
+        g_store[idx].key = malloc(key_len);
+        memcpy(g_store[idx].key, key, key_len);
+        g_store[idx].key_len = key_len;
+        g_store[idx].val = NULL;
+    } else {
+        free(g_store[idx].val);    // overwriting - release the old value
+    }
+    g_store[idx].val = malloc(val_len);
+    memcpy(g_store[idx].val, val, val_len);
+    g_store[idx].val_len = val_len;
+    return 0;
+}
+
+// Returns true if a key was found and removed.
+static bool store_del(const uint8_t *key, size_t key_len) {
+    int idx = store_find(key, key_len);
+    if (idx < 0) {
+        return false;
+    }
+    free(g_store[idx].key);
+    free(g_store[idx].val);
+    g_store[idx].used = false;
+    g_store[idx].key = NULL;
+    g_store[idx].val = NULL;
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Request parsing and command handling
+// ---------------------------------------------------------------------
+
+// One length-prefixed string as parsed out of a request. `data` points
+// directly into the connection's incoming buffer - no copy - which is
+// safe because we always finish using it (building the response) before
+// that buffer gets consumed/overwritten.
+typedef struct {
+    const uint8_t *data;
+    uint32_t len;
+} Str;
+
+// Parse the payload of one message into a list of strings:
+//   [count:4][len:4][string]...[len:4][string]
+// Returns 0 on success, -1 on any malformed input.
+static int32_t parse_req(const uint8_t *data, size_t size, Str *cmd, size_t *argc) {
+    const uint8_t *end = data + size;
+
+    if (data + 4 > end) {
+        return -1;
+    }
+    uint32_t nstr = 0;
+    memcpy(&nstr, data, 4);
+    data += 4;
+    if (nstr > k_max_args) {
+        return -1;
+    }
+
+    size_t i = 0;
+    while (i < nstr) {
+        if (data + 4 > end) {
+            return -1;
+        }
+        uint32_t len = 0;
+        memcpy(&len, data, 4);
+        data += 4;
+        if (data + len > end) {
+            return -1;
+        }
+        cmd[i].data = data;
+        cmd[i].len = len;
+        data += len;
+        i++;
+    }
+
+    if (data != end) {
+        return -1;  // trailing garbage after the last string
+    }
+    *argc = nstr;
+    return 0;
+}
+
+enum {
+    RES_OK = 0,     // success, `data` (if any) is the result
+    RES_ERR = 1,    // unrecognized command or bad arguments
+    RES_NX = 2,     // key not found
+};
+
+typedef struct {
+    uint32_t status;
+    const uint8_t *data;
+    size_t data_len;
+} Response;
+
+static bool cmd_is(Str s, const char *literal) {
+    size_t n = strlen(literal);
+    return s.len == n && memcmp(s.data, literal, n) == 0;
+}
+
+static void do_request(Str *cmd, size_t argc, Response *out) {
+    out->data = NULL;
+    out->data_len = 0;
+
+    if (argc == 2 && cmd_is(cmd[0], "get")) {
+        int idx = store_find(cmd[1].data, cmd[1].len);
+        if (idx < 0) {
+            out->status = RES_NX;
+            return;
+        }
+        out->status = RES_OK;
+        out->data = (const uint8_t *)g_store[idx].val;
+        out->data_len = g_store[idx].val_len;
+
+    } else if (argc == 3 && cmd_is(cmd[0], "set")) {
+        if (store_set(cmd[1].data, cmd[1].len, cmd[2].data, cmd[2].len) != 0) {
+            out->status = RES_ERR;
+            return;
+        }
+        out->status = RES_OK;
+
+    } else if (argc == 2 && cmd_is(cmd[0], "del")) {
+        bool found = store_del(cmd[1].data, cmd[1].len);
+        out->status = RES_OK;
+        static const char one[] = "1";
+        static const char zero[] = "0";
+        out->data = (const uint8_t *)(found ? one : zero);
+        out->data_len = 1;
+
+    } else {
+        out->status = RES_ERR;
+    }
+}
+
+static void make_response(const Response *resp, Buffer *out) {
+    uint32_t body_len = 4 + (uint32_t)resp->data_len;   // 4 bytes for status
+    buf_append(out, (const uint8_t *)&body_len, 4);
+    buf_append(out, (const uint8_t *)&resp->status, 4);
+    if (resp->data_len > 0) {
+        buf_append(out, resp->data, resp->data_len);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -186,14 +386,21 @@ static bool try_one_request(Conn *conn) {
         return false;   // header's here, but the body hasn't fully arrived
     }
 
-    const uint8_t *request = conn->incoming.data + 4;
-    printf("client fd=%d says: %.*s\n", conn->fd, (int)len, request);
+    const uint8_t *payload = conn->incoming.data + 4;
 
-    // For now we just echo the message back (this is what the real Redis
-    // book does at this stage too - actual get/set/del commands come in a
-    // later commit once we have a data store to back them with).
-    buf_append(&conn->outgoing, (const uint8_t *)&len, 4);
-    buf_append(&conn->outgoing, request, len);
+    Str cmd[k_max_args];
+    size_t argc = 0;
+    Response resp;
+
+    if (parse_req(payload, len, cmd, &argc) != 0) {
+        resp.status = RES_ERR;
+        resp.data = NULL;
+        resp.data_len = 0;
+    } else {
+        do_request(cmd, argc, &resp);
+    }
+
+    make_response(&resp, &conn->outgoing);
 
     buf_consume(&conn->incoming, 4 + len);
     return true;
