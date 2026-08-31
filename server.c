@@ -40,14 +40,6 @@ static void die(const char *m) {
 const size_t k_max_msg = 4096;
 const size_t k_max_args = 16;      // max strings in one command
 
-// NOTE: this one has to be a real preprocessor #define, not `const size_t`
-// like the others above. In C (unlike C++), a file-scope `const` is not a
-// true compile-time constant, so it can't be used to size a global array
-// like g_store below - the compiler rejects it as "variably modified at
-// file scope". #define sidesteps this because it's a textual substitution
-// that happens before compilation even starts.
-#define K_MAX_ENTRIES 1024
-
 // ---------------------------------------------------------------------
 // Buffer: a small growable byte array, since plain C doesn't give us
 // std::vector. We only need two operations: append to the back, and
@@ -104,80 +96,238 @@ static void buf_consume(Buffer *b, size_t n) {
 }
 
 // ---------------------------------------------------------------------
-// The data store (Commit 4 placeholder version)
+// The data store (Commit 5: a real hashtable)
 //
-// This is a deliberately dumb, linear-scan key/value table. Every get/set/
-// del walks the whole array comparing keys one at a time - O(N) per
-// operation. That's fine for a handful of keys, and it's genuinely useful
-// as a first version: it's easy to verify by inspection that it's correct.
-// The NEXT commit replaces this with a real hashtable, and you'll be able
-// to directly feel why that matters once you've got more than a few dozen
-// keys in here. Keeping this version around in git history is the point -
-// it's a real before/after for a resume story about Big-O in practice.
+// Commit 4's linear scan was O(N) per operation and capped at 1024 keys.
+// This version is a chaining hashtable with INTRUSIVE nodes (the HNode
+// lives directly inside Entry - no separate allocation for list nodes,
+// same trick as the book), plus progressive resizing so a big rehash
+// never freezes every client at once.
 // ---------------------------------------------------------------------
+
+#include <stddef.h>   // offsetof
+#include <assert.h>
+
+// Recover the address of the struct containing `ptr` as its `member`
+// field. This is what makes the hashtable code "generic" without C++
+// templates or void* - it operates purely on HNode, and container_of()
+// converts back to the real Entry when needed.
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
+
+// An intrusive singly-linked-list node. No data of its own - it lives
+// embedded inside Entry below.
+typedef struct HNode {
+    struct HNode *next;
+    uint64_t hcode;     // cached hash value, avoids recomputing on lookups
+} HNode;
+
+// A fixed-size chaining hashtable: an array of "slots", each slot the head
+// of a linked list of colliding entries.
 typedef struct {
-    bool used;
+    HNode **tab;    // array of slot heads, size (mask + 1)
+    size_t mask;    // always (power of 2) - 1, so hash & mask == hash % size
+    size_t size;    // number of keys currently in this table
+} HTab;
+
+static void h_init(HTab *htab, size_t n) {
+    assert(n > 0 && (n & (n - 1)) == 0);   // n must be a power of 2
+    htab->tab = calloc(n, sizeof(HNode *));
+    htab->mask = n - 1;
+    htab->size = 0;
+}
+
+static void h_insert(HTab *htab, HNode *node) {
+    size_t pos = node->hcode & htab->mask;
+    node->next = htab->tab[pos];
+    htab->tab[pos] = node;
+    htab->size++;
+}
+
+// Returns the address of the pointer THAT POINTS TO the matching node
+// (either a slot in `tab`, or another node's `next` field) - not the node
+// itself. That's deliberate: having the parent pointer's address is what
+// lets deletion (h_detach) unlink a node in O(1) without a special case
+// for "removing the first node in the chain."
+static HNode **h_lookup(HTab *htab, HNode *key, bool (*eq)(HNode *, HNode *)) {
+    if (!htab->tab) {
+        return NULL;
+    }
+    size_t pos = key->hcode & htab->mask;
+    HNode **from = &htab->tab[pos];
+    for (HNode *cur = *from; cur != NULL; cur = *from) {
+        if (cur->hcode == key->hcode && eq(cur, key)) {
+            return from;
+        }
+        from = &cur->next;
+    }
+    return NULL;
+}
+
+static HNode *h_detach(HTab *htab, HNode **from) {
+    HNode *node = *from;
+    *from = node->next;
+    htab->size--;
+    return node;
+}
+
+// HMap: the resizable hashtable built from two HTabs. `newer` is what's
+// normally used; when it gets too full, it becomes `older` and a fresh,
+// bigger `newer` takes over. Keys are migrated from `older` to `newer` a
+// few at a time on every operation (see hm_help_rehashing), instead of
+// all at once - that's what keeps a resize from freezing the server.
+typedef struct {
+    HTab newer;
+    HTab older;
+    size_t migrate_pos;    // where we left off migrating in `older`
+} HMap;
+
+#define K_REHASHING_WORK 128     // max keys migrated per operation
+#define K_MAX_LOAD_FACTOR 8      // trigger a resize once avg chain length hits this
+
+static void hm_help_rehashing(HMap *hmap) {
+    size_t nwork = 0;
+    while (nwork < K_REHASHING_WORK && hmap->older.size > 0) {
+        HNode **from = &hmap->older.tab[hmap->migrate_pos];
+        if (!*from) {
+            hmap->migrate_pos++;
+            continue;   // empty slot, nothing to migrate here
+        }
+        h_insert(&hmap->newer, h_detach(&hmap->older, from));
+        nwork++;
+    }
+    if (hmap->older.size == 0 && hmap->older.tab) {
+        free(hmap->older.tab);
+        hmap->older = (HTab){0};
+    }
+}
+
+static void hm_trigger_rehashing(HMap *hmap) {
+    hmap->older = hmap->newer;                      // newer becomes older
+    h_init(&hmap->newer, (hmap->newer.mask + 1) * 2); // fresh table, 2x size
+    hmap->migrate_pos = 0;
+}
+
+static void hm_insert(HMap *hmap, HNode *node) {
+    if (!hmap->newer.tab) {
+        h_init(&hmap->newer, 4);   // lazily create the table on first use
+    }
+    h_insert(&hmap->newer, node);
+
+    if (!hmap->older.tab) {   // only trigger a NEW resize if one isn't already running
+        size_t threshold = (hmap->newer.mask + 1) * K_MAX_LOAD_FACTOR;
+        if (hmap->newer.size >= threshold) {
+            hm_trigger_rehashing(hmap);
+        }
+    }
+    hm_help_rehashing(hmap);   // migrate a bit more, whether we just triggered or not
+}
+
+static HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *)) {
+    hm_help_rehashing(hmap);   // small, steady progress on every operation
+    HNode **from = h_lookup(&hmap->newer, key, eq);
+    if (!from) {
+        from = h_lookup(&hmap->older, key, eq);
+    }
+    return from ? *from : NULL;
+}
+
+static HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *)) {
+    hm_help_rehashing(hmap);
+    HNode **from = h_lookup(&hmap->newer, key, eq);
+    if (from) {
+        return h_detach(&hmap->newer, from);
+    }
+    from = h_lookup(&hmap->older, key, eq);
+    if (from) {
+        return h_detach(&hmap->older, from);
+    }
+    return NULL;
+}
+
+// FNV-1a: a fast, well-distributed hash function designed for hashtables
+// (NOT a cryptographic hash - using MD5/SHA1 here would be slow and
+// overkill, they solve a different problem).
+static uint64_t fnv1a_hash(const uint8_t *data, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Entry: our actual key/value pair, with an HNode embedded directly in
+// it (the intrusive part). There's no separate list-node allocation -
+// the hashtable's linked list literally runs through these structs.
+typedef struct {
+    HNode node;
     char *key;
     size_t key_len;
     char *val;
     size_t val_len;
 } Entry;
 
-static Entry g_store[K_MAX_ENTRIES];
+static HMap g_db;   // zero-initialized by default (static storage)
 
-// Returns the index of the entry with this key, or -1 if not found.
-static int store_find(const uint8_t *key, size_t key_len) {
-    for (size_t i = 0; i < K_MAX_ENTRIES; i++) {
-        if (g_store[i].used
-            && g_store[i].key_len == key_len
-            && memcmp(g_store[i].key, key, key_len) == 0) {
-            return (int)i;
-        }
-    }
-    return -1;
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    Entry *le = container_of(lhs, Entry, node);
+    Entry *re = container_of(rhs, Entry, node);
+    return le->key_len == re->key_len
+        && memcmp(le->key, re->key, le->key_len) == 0;
 }
 
-// Insert or overwrite a key. Returns 0 on success, -1 if the store is full
-// and this is a brand new key (updates to existing keys always succeed).
+// Returns the matching Entry, or NULL if the key isn't present.
+static Entry *store_find(const uint8_t *key, size_t key_len) {
+    // A throwaway Entry just for the lookup - its key POINTS AT the
+    // caller's bytes rather than copying them, since it never outlives
+    // this function call and is never inserted into the table.
+    Entry lookup_key;
+    lookup_key.key = (char *)key;
+    lookup_key.key_len = key_len;
+    lookup_key.node.hcode = fnv1a_hash(key, key_len);
+
+    HNode *node = hm_lookup(&g_db, &lookup_key.node, &entry_eq);
+    return node ? container_of(node, Entry, node) : NULL;
+}
+
+// Insert or overwrite a key. Always succeeds (memory allocation failure
+// aside) - no more "store is full" limitation from Commit 4.
 static int store_set(const uint8_t *key, size_t key_len,
                       const uint8_t *val, size_t val_len) {
-    int idx = store_find(key, key_len);
-    if (idx < 0) {
-        // find an empty slot for a new key
-        for (size_t i = 0; i < K_MAX_ENTRIES; i++) {
-            if (!g_store[i].used) {
-                idx = (int)i;
-                break;
-            }
-        }
-        if (idx < 0) {
-            return -1;  // store is full - a real limitation of this version
-        }
-        g_store[idx].used = true;
-        g_store[idx].key = malloc(key_len);
-        memcpy(g_store[idx].key, key, key_len);
-        g_store[idx].key_len = key_len;
-        g_store[idx].val = NULL;
+    Entry *ent = store_find(key, key_len);
+    if (ent) {
+        free(ent->val);     // overwriting - release the old value
     } else {
-        free(g_store[idx].val);    // overwriting - release the old value
+        ent = malloc(sizeof(Entry));
+        ent->key = malloc(key_len);
+        memcpy(ent->key, key, key_len);
+        ent->key_len = key_len;
+        ent->node.hcode = fnv1a_hash(key, key_len);
+        ent->node.next = NULL;
+        hm_insert(&g_db, &ent->node);
     }
-    g_store[idx].val = malloc(val_len);
-    memcpy(g_store[idx].val, val, val_len);
-    g_store[idx].val_len = val_len;
+    ent->val = malloc(val_len);
+    memcpy(ent->val, val, val_len);
+    ent->val_len = val_len;
     return 0;
 }
 
 // Returns true if a key was found and removed.
 static bool store_del(const uint8_t *key, size_t key_len) {
-    int idx = store_find(key, key_len);
-    if (idx < 0) {
+    Entry lookup_key;
+    lookup_key.key = (char *)key;
+    lookup_key.key_len = key_len;
+    lookup_key.node.hcode = fnv1a_hash(key, key_len);
+
+    HNode *node = hm_delete(&g_db, &lookup_key.node, &entry_eq);
+    if (!node) {
         return false;
     }
-    free(g_store[idx].key);
-    free(g_store[idx].val);
-    g_store[idx].used = false;
-    g_store[idx].key = NULL;
-    g_store[idx].val = NULL;
+    Entry *ent = container_of(node, Entry, node);
+    free(ent->key);
+    free(ent->val);
+    free(ent);
     return true;
 }
 
@@ -256,14 +406,14 @@ static void do_request(Str *cmd, size_t argc, Response *out) {
     out->data_len = 0;
 
     if (argc == 2 && cmd_is(cmd[0], "get")) {
-        int idx = store_find(cmd[1].data, cmd[1].len);
-        if (idx < 0) {
+        Entry *ent = store_find(cmd[1].data, cmd[1].len);
+        if (!ent) {
             out->status = RES_NX;
             return;
         }
         out->status = RES_OK;
-        out->data = (const uint8_t *)g_store[idx].val;
-        out->data_len = g_store[idx].val_len;
+        out->data = (const uint8_t *)ent->val;
+        out->data_len = ent->val_len;
 
     } else if (argc == 3 && cmd_is(cmd[0], "set")) {
         if (store_set(cmd[1].data, cmd[1].len, cmd[2].data, cmd[2].len) != 0) {
