@@ -82,23 +82,43 @@ static const uint8_t *print_one(const uint8_t *cur, const uint8_t *end, int inde
         break;
 
     case TAG_ERR: {
+        if (cur + 8 > end) {
+            printf("(truncated response)\n");
+            return end;
+        }
         uint32_t code = 0, mlen = 0;
         memcpy(&code, cur, 4); cur += 4;
         memcpy(&mlen, cur, 4); cur += 4;
+        if (cur + mlen > end) {
+            printf("(truncated response)\n");
+            return end;
+        }
         printf("(error %u) %.*s\n", code, (int)mlen, cur);
         cur += mlen;
         break;
     }
 
     case TAG_STR: {
+        if (cur + 4 > end) {
+            printf("(truncated response)\n");
+            return end;
+        }
         uint32_t len = 0;
         memcpy(&len, cur, 4); cur += 4;
+        if (cur + len > end) {
+            printf("(truncated response)\n");
+            return end;
+        }
         printf("%.*s\n", (int)len, cur);
         cur += len;
         break;
     }
 
     case TAG_INT: {
+        if (cur + 8 > end) {
+            printf("(truncated response)\n");
+            return end;
+        }
         int64_t val = 0;
         memcpy(&val, cur, 8); cur += 8;
         printf("(integer) %lld\n", (long long)val);
@@ -106,10 +126,14 @@ static const uint8_t *print_one(const uint8_t *cur, const uint8_t *end, int inde
     }
 
     case TAG_ARR: {
+        if (cur + 4 > end) {
+            printf("(truncated response)\n");
+            return end;
+        }
         uint32_t n = 0;
         memcpy(&n, cur, 4); cur += 4;
         printf("(array, %u item%s)\n", n, n == 1 ? "" : "s");
-        for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t i = 0; i < n && cur < end; i++) {
             printf("%*s%u) ", indent + 2, "", i + 1);
             cur = print_one(cur, end, indent + 2);
         }
