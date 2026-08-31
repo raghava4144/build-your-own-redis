@@ -384,64 +384,156 @@ static int32_t parse_req(const uint8_t *data, size_t size, Str *cmd, size_t *arg
     return 0;
 }
 
+// ---------------------------------------------------------------------
+// Serialization (Commit 6): Tag-Length-Value encoding
+//
+// Commit 4-5's response was always [status:4][raw bytes] - fine for "here's
+// a string" but it can't tell an integer apart from a string, and it can't
+// represent a LIST of things at all. This is the same problem real binary
+// formats solve: put a tag byte before each value saying what kind of
+// value it is, so the reader knows how to interpret what follows -
+// including, for arrays, that what follows is itself more tagged values.
+// ---------------------------------------------------------------------
 enum {
-    RES_OK = 0,     // success, `data` (if any) is the result
-    RES_ERR = 1,    // unrecognized command or bad arguments
-    RES_NX = 2,     // key not found
+    TAG_NIL = 0,    // no value (e.g. GET on a missing key)
+    TAG_ERR = 1,    // an error code + message
+    TAG_STR = 2,    // a length-prefixed string
+    TAG_INT = 3,    // a 64-bit integer
+    TAG_ARR = 4,    // a count, followed by that many tagged values
 };
 
-typedef struct {
-    uint32_t status;
-    const uint8_t *data;
-    size_t data_len;
-} Response;
+static void out_nil(Buffer *out) {
+    uint8_t tag = TAG_NIL;
+    buf_append(out, &tag, 1);
+}
+
+static void out_str(Buffer *out, const char *s, size_t len) {
+    uint8_t tag = TAG_STR;
+    buf_append(out, &tag, 1);
+    uint32_t l = (uint32_t)len;
+    buf_append(out, (const uint8_t *)&l, 4);
+    buf_append(out, (const uint8_t *)s, len);
+}
+
+static void out_int(Buffer *out, int64_t val) {
+    uint8_t tag = TAG_INT;
+    buf_append(out, &tag, 1);
+    buf_append(out, (const uint8_t *)&val, 8);
+}
+
+static void out_err(Buffer *out, uint32_t code, const char *msg) {
+    uint8_t tag = TAG_ERR;
+    buf_append(out, &tag, 1);
+    buf_append(out, (const uint8_t *)&code, 4);
+    uint32_t mlen = (uint32_t)strlen(msg);
+    buf_append(out, (const uint8_t *)&mlen, 4);
+    buf_append(out, (const uint8_t *)msg, mlen);
+}
+
+// Only writes the tag + count. The caller is responsible for following
+// this with exactly `n` more tagged values (out_str/out_int/etc, even
+// nested out_arr calls) - the format doesn't enforce this itself, same
+// as the book's version.
+static void out_arr(Buffer *out, uint32_t n) {
+    uint8_t tag = TAG_ARR;
+    buf_append(out, &tag, 1);
+    buf_append(out, (const uint8_t *)&n, 4);
+}
+
+// ---------------------------------------------------------------------
+// hm_foreach: walk every key in the hashtable, calling `cb` on each one.
+// Needed for the new `keys` command below - this is the first time we
+// need to iterate the WHOLE table rather than look up one specific key.
+// ---------------------------------------------------------------------
+typedef void (*HScanCb)(HNode *, void *);
+
+static void h_scan(HTab *tab, HScanCb cb, void *arg) {
+    if (!tab->tab) {
+        return;
+    }
+    for (size_t i = 0; i <= tab->mask; i++) {
+        for (HNode *node = tab->tab[i]; node != NULL; node = node->next) {
+            cb(node, arg);
+        }
+    }
+}
+
+// Scans BOTH tables - important during a resize, when some keys are still
+// sitting in `older` waiting to be migrated. Skipping it would mean `keys`
+// silently misses keys that haven't been migrated yet.
+static void hm_foreach(HMap *hmap, HScanCb cb, void *arg) {
+    h_scan(&hmap->newer, cb, arg);
+    h_scan(&hmap->older, cb, arg);
+}
+
+static size_t hm_size(HMap *hmap) {
+    return hmap->newer.size + hmap->older.size;
+}
 
 static bool cmd_is(Str s, const char *literal) {
     size_t n = strlen(literal);
     return s.len == n && memcmp(s.data, literal, n) == 0;
 }
 
-static void do_request(Str *cmd, size_t argc, Response *out) {
-    out->data = NULL;
-    out->data_len = 0;
+static void cb_keys(HNode *node, void *arg) {
+    Buffer *out = (Buffer *)arg;
+    Entry *ent = container_of(node, Entry, node);
+    out_str(out, ent->key, ent->key_len);
+}
 
+// Note the signature change from Commit 5: instead of filling in a
+// Response struct and having a separate make_response() step, we write
+// directly into the output buffer as we go. This is necessary for `keys`
+// - an array's size isn't known as one fixed struct, it's produced by
+// writing values one at a time as we walk the hashtable.
+static void do_request(Str *cmd, size_t argc, Buffer *out) {
     if (argc == 2 && cmd_is(cmd[0], "get")) {
         Entry *ent = store_find(cmd[1].data, cmd[1].len);
         if (!ent) {
-            out->status = RES_NX;
+            out_nil(out);
             return;
         }
-        out->status = RES_OK;
-        out->data = (const uint8_t *)ent->val;
-        out->data_len = ent->val_len;
+        out_str(out, ent->val, ent->val_len);
 
     } else if (argc == 3 && cmd_is(cmd[0], "set")) {
-        if (store_set(cmd[1].data, cmd[1].len, cmd[2].data, cmd[2].len) != 0) {
-            out->status = RES_ERR;
-            return;
-        }
-        out->status = RES_OK;
+        store_set(cmd[1].data, cmd[1].len, cmd[2].data, cmd[2].len);
+        out_nil(out);   // real Redis replies "OK" here; we keep it simple
 
     } else if (argc == 2 && cmd_is(cmd[0], "del")) {
         bool found = store_del(cmd[1].data, cmd[1].len);
-        out->status = RES_OK;
-        static const char one[] = "1";
-        static const char zero[] = "0";
-        out->data = (const uint8_t *)(found ? one : zero);
-        out->data_len = 1;
+        out_int(out, found ? 1 : 0);
+
+    } else if (argc == 1 && cmd_is(cmd[0], "keys")) {
+        out_arr(out, (uint32_t)hm_size(&g_db));
+        hm_foreach(&g_db, &cb_keys, out);
 
     } else {
-        out->status = RES_ERR;
+        out_err(out, 1, "unrecognized command or wrong number of arguments");
     }
 }
 
-static void make_response(const Response *resp, Buffer *out) {
-    uint32_t body_len = 4 + (uint32_t)resp->data_len;   // 4 bytes for status
-    buf_append(out, (const uint8_t *)&body_len, 4);
-    buf_append(out, (const uint8_t *)&resp->status, 4);
-    if (resp->data_len > 0) {
-        buf_append(out, resp->data, resp->data_len);
+// Reserve 4 bytes at the current position for the outer message length,
+// which we don't know yet - do_request() is about to write a variable
+// amount of data. We come back and fill this in once we know the total
+// (see response_end below). Returns the position of the reserved header,
+// so the caller can pass it back.
+static size_t response_begin(Buffer *out) {
+    size_t header_pos = out->size;
+    uint32_t placeholder = 0;
+    buf_append(out, (const uint8_t *)&placeholder, 4);
+    return header_pos;
+}
+
+static void response_end(Buffer *out, size_t header_pos) {
+    uint32_t msg_len = (uint32_t)(out->size - header_pos - 4);
+    if (msg_len > k_max_msg) {
+        // Whatever we wrote was too big - throw it away and write a
+        // proper error instead, so we never send an oversized message.
+        out->size = header_pos + 4;
+        out_err(out, 2, "response too big");
+        msg_len = (uint32_t)(out->size - header_pos - 4);
     }
+    memcpy(out->data + header_pos, &msg_len, 4);
 }
 
 // ---------------------------------------------------------------------
@@ -540,17 +632,14 @@ static bool try_one_request(Conn *conn) {
 
     Str cmd[k_max_args];
     size_t argc = 0;
-    Response resp;
 
+    size_t header_pos = response_begin(&conn->outgoing);
     if (parse_req(payload, len, cmd, &argc) != 0) {
-        resp.status = RES_ERR;
-        resp.data = NULL;
-        resp.data_len = 0;
+        out_err(&conn->outgoing, 1, "bad request");
     } else {
-        do_request(cmd, argc, &resp);
+        do_request(cmd, argc, &conn->outgoing);
     }
-
-    make_response(&resp, &conn->outgoing);
+    response_end(&conn->outgoing, header_pos);
 
     buf_consume(&conn->incoming, 4 + len);
     return true;

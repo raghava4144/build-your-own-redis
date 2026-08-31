@@ -1,16 +1,16 @@
 // client.c
 //
-// Commit 4: a real command-line client.
+// Commit 6: parse the new tagged response format.
 //
 //   ./client set name raghava
 //   ./client get name
 //   ./client del name
+//   ./client keys          <- new! only possible now that we can return arrays
 //
-// Instead of sending one flat string, we now send a properly structured
-// command: a count, followed by each argument as its own length-prefixed
-// string. This mirrors how you'd type a command in a terminal - a command
-// word plus some arguments - and it's what lets the server tell "set" from
-// "name" from "raghava" instead of getting one blob of bytes.
+// The request side (sending a command) is unchanged from Commit 4. What's
+// new is print_one() below, which reads a tag byte and decides how to
+// interpret what follows - including recursing into itself for arrays,
+// since an array can contain any other tagged value (even another array).
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,19 +56,78 @@ static int32_t write_all(int fd, const char *buf, size_t n) {
     return 0;
 }
 
-// Response status codes - must match the server's enum in server.c.
+// Tags - must match the server's enum in server.c.
 enum {
-    RES_OK = 0,
-    RES_ERR = 1,
-    RES_NX = 2,
+    TAG_NIL = 0,
+    TAG_ERR = 1,
+    TAG_STR = 2,
+    TAG_INT = 3,
+    TAG_ARR = 4,
 };
 
-// Send one command (argv-style: an array of strings) as:
-//   [outer len:4][count:4][len:4][string]...[len:4][string]
-// then read and print the server's [status][data] reply.
+// Parse and print ONE tagged value starting at `cur`. Returns a pointer
+// just past the value that was consumed, so the caller (or a recursive
+// call, for arrays) knows where the next value starts.
+static const uint8_t *print_one(const uint8_t *cur, const uint8_t *end, int indent) {
+    if (cur >= end) {
+        printf("(truncated response)\n");
+        return end;
+    }
+
+    uint8_t tag = *cur++;
+
+    switch (tag) {
+    case TAG_NIL:
+        printf("(nil)\n");
+        break;
+
+    case TAG_ERR: {
+        uint32_t code = 0, mlen = 0;
+        memcpy(&code, cur, 4); cur += 4;
+        memcpy(&mlen, cur, 4); cur += 4;
+        printf("(error %u) %.*s\n", code, (int)mlen, cur);
+        cur += mlen;
+        break;
+    }
+
+    case TAG_STR: {
+        uint32_t len = 0;
+        memcpy(&len, cur, 4); cur += 4;
+        printf("%.*s\n", (int)len, cur);
+        cur += len;
+        break;
+    }
+
+    case TAG_INT: {
+        int64_t val = 0;
+        memcpy(&val, cur, 8); cur += 8;
+        printf("(integer) %lld\n", (long long)val);
+        break;
+    }
+
+    case TAG_ARR: {
+        uint32_t n = 0;
+        memcpy(&n, cur, 4); cur += 4;
+        printf("(array, %u item%s)\n", n, n == 1 ? "" : "s");
+        for (uint32_t i = 0; i < n; i++) {
+            printf("%*s%u) ", indent + 2, "", i + 1);
+            cur = print_one(cur, end, indent + 2);
+        }
+        break;
+    }
+
+    default:
+        printf("(unknown tag %d - client/server version mismatch?)\n", tag);
+        cur = end;   // can't safely continue parsing an unknown format
+        break;
+    }
+
+    return cur;
+}
+
 static int32_t send_command(int fd, char **args, int argc) {
     char wbuf[4 + k_max_msg];
-    size_t pos = 4;   // leave room for the outer length, filled in later
+    size_t pos = 4;
 
     uint32_t nstr = (uint32_t)argc;
     memcpy(&wbuf[pos], &nstr, 4);
@@ -93,7 +152,6 @@ static int32_t send_command(int fd, char **args, int argc) {
         return -1;
     }
 
-    // read the reply: [outer len:4][status:4][data...]
     char rbuf[4 + k_max_msg];
     errno = 0;
     if (read_full(fd, rbuf, 4) != 0) {
@@ -103,7 +161,7 @@ static int32_t send_command(int fd, char **args, int argc) {
 
     uint32_t reply_len = 0;
     memcpy(&reply_len, rbuf, 4);
-    if (reply_len < 4 || reply_len > k_max_msg) {
+    if (reply_len > k_max_msg) {
         msg("bad reply length");
         return -1;
     }
@@ -113,27 +171,8 @@ static int32_t send_command(int fd, char **args, int argc) {
         return -1;
     }
 
-    uint32_t status = 0;
-    memcpy(&status, &rbuf[4], 4);
-    const char *data = &rbuf[8];
-    size_t data_len = reply_len - 4;
-
-    switch (status) {
-    case RES_OK:
-        if (data_len > 0) {
-            printf("%.*s\n", (int)data_len, data);
-        } else {
-            printf("OK\n");
-        }
-        break;
-    case RES_NX:
-        printf("(nil)\n");
-        break;
-    case RES_ERR:
-    default:
-        printf("(error) unrecognized command or wrong number of arguments\n");
-        break;
-    }
+    const uint8_t *body = (const uint8_t *)&rbuf[4];
+    print_one(body, body + reply_len, 0);
 
     return 0;
 }
@@ -144,6 +183,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  e.g. %s set name raghava\n", argv[0]);
         fprintf(stderr, "       %s get name\n", argv[0]);
         fprintf(stderr, "       %s del name\n", argv[0]);
+        fprintf(stderr, "       %s keys\n", argv[0]);
         return 1;
     }
 
