@@ -69,3 +69,4 @@ Testing/
 *.dSYM/
 client
 server
+.DS_Store
