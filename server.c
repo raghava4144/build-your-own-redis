@@ -32,6 +32,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <time.h>      // clock_gettime, for timers
+#include <pthread.h>   // thread pool, Commit 9
 
 static void die(const char *m) {
     perror(m);
@@ -813,6 +814,130 @@ static Entry *store_find(const uint8_t *key, size_t key_len) {
     return node ? container_of(node, Entry, node) : NULL;
 }
 
+// ---------------------------------------------------------------------
+// Thread pool (Commit 9): offload freeing a LARGE sorted set to a
+// background thread, so deleting/overwriting a key with thousands of
+// members doesn't stall every other connected client while we walk the
+// whole thing and free each node.
+//
+// Producer-consumer, the standard pattern: a shared queue, a mutex
+// protecting it, and a condition variable so idle worker threads sleep
+// instead of busy-waiting when there's no work.
+//
+// IMPORTANT SAFETY PROPERTY: worker threads here NEVER touch g_db,
+// g_heap, or any live Entry - they only operate on a ZSet that's already
+// been fully detached (copied out by value) from the system before being
+// handed off. That's what makes this safe without needing to protect our
+// main data structures with locks: by the time a worker thread sees the
+// data, nothing else in the program has a reference to it anymore.
+// ---------------------------------------------------------------------
+typedef struct WorkNode {
+    void (*func)(void *);
+    void *arg;
+    struct WorkNode *next;
+} WorkNode;
+
+typedef struct {
+    pthread_t *threads;
+    size_t num_threads;
+    WorkNode *head;   // FIFO queue: push at tail, pop at head
+    WorkNode *tail;
+    pthread_mutex_t mu;
+    pthread_cond_t not_empty;
+} ThreadPool;
+
+static void *tp_worker(void *arg) {
+    ThreadPool *tp = (ThreadPool *)arg;
+    while (1) {
+        pthread_mutex_lock(&tp->mu);
+        // Always re-check the condition in a loop, not an if - see the
+        // "spurious wakeups" discussion in the book. With multiple worker
+        // threads, one can be woken by a signal meant for another and
+        // find the queue already emptied by whoever got there first.
+        while (!tp->head) {
+            pthread_cond_wait(&tp->not_empty, &tp->mu);
+        }
+        WorkNode *node = tp->head;
+        tp->head = node->next;
+        if (!tp->head) {
+            tp->tail = NULL;
+        }
+        pthread_mutex_unlock(&tp->mu);
+
+        node->func(node->arg);   // do the actual work OUTSIDE the lock
+        free(node);
+    }
+    return NULL;
+}
+
+static void thread_pool_init(ThreadPool *tp, size_t num_threads) {
+    pthread_mutex_init(&tp->mu, NULL);
+    pthread_cond_init(&tp->not_empty, NULL);
+    tp->head = tp->tail = NULL;
+    tp->num_threads = num_threads;
+    tp->threads = malloc(num_threads * sizeof(pthread_t));
+    for (size_t i = 0; i < num_threads; i++) {
+        if (pthread_create(&tp->threads[i], NULL, &tp_worker, tp) != 0) {
+            die("pthread_create");
+        }
+    }
+}
+
+static void thread_pool_queue(ThreadPool *tp, void (*func)(void *), void *arg) {
+    WorkNode *node = malloc(sizeof(WorkNode));
+    node->func = func;
+    node->arg = arg;
+    node->next = NULL;
+
+    pthread_mutex_lock(&tp->mu);
+    if (tp->tail) {
+        tp->tail->next = node;
+    } else {
+        tp->head = node;   // queue was empty
+    }
+    tp->tail = node;
+    pthread_cond_signal(&tp->not_empty);   // wake ONE sleeping worker
+    pthread_mutex_unlock(&tp->mu);
+}
+
+static ThreadPool g_thread_pool;
+
+#ifndef K_LARGE_CONTAINER_SIZE
+#define K_LARGE_CONTAINER_SIZE 1000   // overridable at compile time for testing
+#endif
+
+// A heap-allocated box just so we have something to hand a whole ZSet
+// (by value - root pointer, hashtable, everything) across to a worker
+// thread as a single void* argument.
+typedef struct {
+    ZSet zset;
+} ZSetBox;
+
+static void zset_free_worker(void *arg) {
+    ZSetBox *box = (ZSetBox *)arg;
+    zset_clear(&box->zset);
+    free(box);
+}
+
+// Decide whether to free this zset's contents right now (small, cheap)
+// or hand it off to a worker thread (large, potentially slow). Either
+// way, `*zset` is left empty/unusable after this call - the caller
+// should not touch it again.
+// Forward-declared: hm_size() is defined later in the file (Commit 6,
+// alongside hm_foreach), but we need it here, ahead of its definition.
+static size_t hm_size(HMap *hmap);
+
+static void zset_destroy(ZSet *zset) {
+    size_t size = hm_size(&zset->hmap);
+    if (size > K_LARGE_CONTAINER_SIZE) {
+        ZSetBox *box = malloc(sizeof(ZSetBox));
+        box->zset = *zset;   // struct copy - box now owns everything zset pointed to
+        thread_pool_queue(&g_thread_pool, &zset_free_worker, box);
+    } else {
+        zset_clear(zset);
+    }
+}
+
 // Insert or overwrite a key. Always succeeds (memory allocation failure
 // aside) - no more "store is full" limitation from Commit 4.
 static int store_set(const uint8_t *key, size_t key_len,
@@ -822,7 +947,7 @@ static int store_set(const uint8_t *key, size_t key_len,
         // SET always overwrites, regardless of what type was there before
         // (same behavior as real Redis) - free whatever the old value was.
         if (ent->type == T_ZSET) {
-            zset_clear(&ent->zset);
+            zset_destroy(&ent->zset);
         } else {
             free(ent->val);
         }
@@ -845,7 +970,6 @@ static int store_set(const uint8_t *key, size_t key_len,
     return 0;
 }
 
-// Returns true if a key was found and removed.
 // Set (ttl_ms >= 0) or cancel (ttl_ms < 0) a key's expiration timer.
 // Keeps Entry::heap_idx and its slot in g_heap in sync in both
 // directions - this is the ONLY place that should touch either one.
@@ -868,6 +992,7 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
     }
 }
 
+// Returns true if a key was found and removed.
 static bool store_del(const uint8_t *key, size_t key_len) {
     Entry lookup_key;
     lookup_key.key = (char *)key;
@@ -883,7 +1008,13 @@ static bool store_del(const uint8_t *key, size_t key_len) {
                                // dangling pointer sitting in g_heap
     free(ent->key);
     if (ent->type == T_ZSET) {
-        zset_clear(&ent->zset);
+        // The Entry struct itself is tiny and always freed immediately
+        // below - only the POTENTIALLY HUGE zset contents might get
+        // deferred to a worker thread. zset_destroy() has already fully
+        // detached everything it needs by the time it returns, so it's
+        // always safe to free `ent` right after, regardless of which
+        // path (sync or async) it took internally.
+        zset_destroy(&ent->zset);
     } else {
         free(ent->val);
     }
@@ -1553,6 +1684,12 @@ static void process_timers(void) {
 
 int main(void) {
     dlist_init(&g_idle_list);
+
+    // 4 worker threads is a reasonable default - enough to keep multiple
+    // large deletes from queueing up behind each other, without spawning
+    // more threads than this workload could ever actually use at once.
+    thread_pool_init(&g_thread_pool, 4);
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         die("socket()");
