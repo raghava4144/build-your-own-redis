@@ -224,6 +224,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "       %s zscore leaderboard alice\n", argv[0]);
         fprintf(stderr, "       %s zrem leaderboard alice\n", argv[0]);
         fprintf(stderr, "       %s zquery leaderboard 0 \"\" 0 10\n", argv[0]);
+        fprintf(stderr, "       %s expire name 5000\n", argv[0]);
+        fprintf(stderr, "       %s ttl name\n", argv[0]);
+        fprintf(stderr, "       %s persist name\n", argv[0]);
         return 1;
     }
 

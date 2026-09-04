@@ -31,6 +31,7 @@
 #include <poll.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <time.h>      // clock_gettime, for timers
 
 static void die(const char *m) {
     perror(m);
@@ -613,6 +614,157 @@ static void zset_free_cb(HNode *node, void *arg) {
 
 static void zset_clear(ZSet *zset);   // forward-declared, defined after hm_foreach below
 
+// ---------------------------------------------------------------------
+// Timers (Commit 8) - defined here, ahead of Entry, because Entry needs
+// a heap_idx field and entry_set_ttl() (added further down) needs the
+// heap functions below to already be declared.
+//
+// clock_gettime(CLOCK_MONOTONIC, ...) instead of CLOCK_REALTIME: wall-clock
+// time (the actual date/time) can jump backwards or forwards if the OS
+// adjusts it (NTP sync, manual change, etc), which would corrupt any
+// duration math ("how long has this been idle"). Monotonic time only ever
+// moves forward and isn't tied to any real-world clock - exactly what we
+// want for measuring elapsed time.
+// ---------------------------------------------------------------------
+static uint64_t get_monotonic_msec(void) {
+    struct timespec ts = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+// A circular doubly-linked list, used for idle-connection timeouts. Since
+// EVERY connection gets the same timeout duration, whoever's been idle
+// longest is always at the front - so this never needs to be searched or
+// sorted, just "move to the back on activity, check the front for
+// expiry." The dummy head node (never itself a real connection) means
+// insert/detach never need a special case for an empty list.
+typedef struct DList {
+    struct DList *prev;
+    struct DList *next;
+} DList;
+
+static void dlist_init(DList *node) {
+    node->prev = node->next = node;
+}
+
+static bool dlist_empty(DList *node) {
+    return node->next == node;
+}
+
+static void dlist_detach(DList *node) {
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+}
+
+static void dlist_insert_before(DList *target, DList *rookie) {
+    DList *prev = target->prev;
+    prev->next = rookie;
+    rookie->prev = prev;
+    rookie->next = target;
+    target->prev = rookie;
+}
+
+// ---------------------------------------------------------------------
+// Heap: array-encoded binary min-heap, used for key TTLs (EXPIRE).
+//
+// Unlike connection timeouts, TTLs are ARBITRARY - one key might expire
+// in 2 seconds, another in 2 hours. A linked list only works when every
+// timeout is the same duration; here we genuinely need "always know the
+// SMALLEST value, cheaply" - that's exactly what a min-heap gives us:
+// O(1) to peek the minimum, O(log N) to insert/update/remove.
+// ---------------------------------------------------------------------
+typedef struct {
+    uint64_t val;    // the expiration timestamp (monotonic ms)
+    size_t *ref;      // points back to the OWNER's record of its own heap
+                        // index (Entry::heap_idx below) - see the note on
+                        // heap_up/heap_down for why this indirection matters
+} HeapItem;
+
+static size_t heap_parent(size_t i) { return (i + 1) / 2 - 1; }
+static size_t heap_left(size_t i) { return i * 2 + 1; }
+static size_t heap_right(size_t i) { return i * 2 + 2; }
+
+// Bubble the item at `pos` UP while it's smaller than its parent. Every
+// swap updates *item.ref too - that's the whole point of storing a
+// pointer back to the owner's index field instead of just a plain value:
+// when items move around in the array, whoever owns them needs to find
+// out, or a later heap_update()/heap_remove() would look in the wrong slot.
+static void heap_up(HeapItem *a, size_t pos) {
+    HeapItem t = a[pos];
+    while (pos > 0 && a[heap_parent(pos)].val > t.val) {
+        a[pos] = a[heap_parent(pos)];
+        *a[pos].ref = pos;
+        pos = heap_parent(pos);
+    }
+    a[pos] = t;
+    *a[pos].ref = pos;
+}
+
+static void heap_down(HeapItem *a, size_t pos, size_t len) {
+    HeapItem t = a[pos];
+    while (true) {
+        size_t l = heap_left(pos);
+        size_t r = heap_right(pos);
+        size_t min_pos = pos;
+        uint64_t min_val = t.val;
+        if (l < len && a[l].val < min_val) {
+            min_pos = l;
+            min_val = a[l].val;
+        }
+        if (r < len && a[r].val < min_val) {
+            min_pos = r;
+        }
+        if (min_pos == pos) {
+            break;
+        }
+        a[pos] = a[min_pos];
+        *a[pos].ref = pos;
+        pos = min_pos;
+    }
+    a[pos] = t;
+    *a[pos].ref = pos;
+}
+
+static void heap_update(HeapItem *a, size_t pos, size_t len) {
+    if (pos > 0 && a[heap_parent(pos)].val > a[pos].val) {
+        heap_up(a, pos);
+    } else {
+        heap_down(a, pos, len);
+    }
+}
+
+// A dynamic array of HeapItem - grows like Buffer does, capacity doubling.
+typedef struct {
+    HeapItem *data;
+    size_t size;
+    size_t cap;
+} Heap;
+
+static void heap_push(Heap *h, HeapItem item) {
+    if (h->size == h->cap) {
+        size_t new_cap = h->cap ? h->cap * 2 : 16;
+        h->data = realloc(h->data, new_cap * sizeof(HeapItem));
+        h->cap = new_cap;
+    }
+    h->data[h->size] = item;
+    h->size++;
+    heap_update(h->data, h->size - 1, h->size);
+}
+
+// Remove the item at `pos` (not necessarily the minimum - a key can have
+// its TTL cancelled or updated from anywhere, not just when it expires).
+// Swap-with-last-then-shrink is O(1), vs O(N) to shift everything down
+// like a plain array delete would need.
+static void heap_remove(Heap *h, size_t pos) {
+    h->data[pos] = h->data[h->size - 1];
+    h->size--;
+    if (pos < h->size) {
+        heap_update(h->data, pos, h->size);
+    }
+}
+
+static Heap g_heap;   // zero-initialized: empty heap, no TTLs set yet
+
 // Entry: our actual key/value pair, with an HNode embedded directly in
 // it (the intrusive part). There's no separate list-node allocation -
 // the hashtable's linked list literally runs through these structs.
@@ -635,6 +787,7 @@ typedef struct {
     char *val;          // meaningful when type == T_STR
     size_t val_len;
     ZSet zset;           // meaningful when type == T_ZSET
+    size_t heap_idx;     // this entry's position in g_heap, or SIZE_MAX if no TTL set
 } Entry;
 
 static HMap g_db;   // zero-initialized by default (static storage)
@@ -680,6 +833,9 @@ static int store_set(const uint8_t *key, size_t key_len,
         ent->key_len = key_len;
         ent->node.hcode = fnv1a_hash(key, key_len);
         ent->node.next = NULL;
+        ent->heap_idx = SIZE_MAX;   // no TTL yet - 0 would be a real heap
+                                     // slot, so calloc's zeroing is NOT
+                                     // safe to rely on here
         hm_insert(&g_db, &ent->node);
     }
     ent->type = T_STR;
@@ -690,6 +846,28 @@ static int store_set(const uint8_t *key, size_t key_len,
 }
 
 // Returns true if a key was found and removed.
+// Set (ttl_ms >= 0) or cancel (ttl_ms < 0) a key's expiration timer.
+// Keeps Entry::heap_idx and its slot in g_heap in sync in both
+// directions - this is the ONLY place that should touch either one.
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
+    if (ttl_ms < 0) {
+        if (ent->heap_idx != SIZE_MAX) {
+            heap_remove(&g_heap, ent->heap_idx);
+            ent->heap_idx = SIZE_MAX;
+        }
+        return;
+    }
+    uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
+    if (ent->heap_idx != SIZE_MAX) {
+        // already has a TTL - just update it in place
+        g_heap.data[ent->heap_idx].val = expire_at;
+        heap_update(g_heap.data, ent->heap_idx, g_heap.size);
+    } else {
+        HeapItem item = { expire_at, &ent->heap_idx };
+        heap_push(&g_heap, item);
+    }
+}
+
 static bool store_del(const uint8_t *key, size_t key_len) {
     Entry lookup_key;
     lookup_key.key = (char *)key;
@@ -701,6 +879,8 @@ static bool store_del(const uint8_t *key, size_t key_len) {
         return false;
     }
     Entry *ent = container_of(node, Entry, node);
+    entry_set_ttl(ent, -1);   // cancel any pending TTL - never leave a
+                               // dangling pointer sitting in g_heap
     free(ent->key);
     if (ent->type == T_ZSET) {
         zset_clear(&ent->zset);
@@ -961,6 +1141,45 @@ static void do_request(Str *cmd, size_t argc, Buffer *out) {
         out_arr(out, (uint32_t)hm_size(&g_db));
         hm_foreach(&g_db, &cb_keys, out);
 
+    } else if (argc == 3 && cmd_is(cmd[0], "expire")) {
+        // expire key <ttl_ms>
+        int64_t ttl_ms;
+        if (!parse_int(cmd[2], &ttl_ms)) {
+            out_err(out, 1, "expected an integer number of milliseconds");
+            return;
+        }
+        Entry *ent = store_find(cmd[1].data, cmd[1].len);
+        if (!ent) {
+            out_int(out, 0);   // real Redis convention: 0 = key didn't exist
+            return;
+        }
+        entry_set_ttl(ent, ttl_ms);
+        out_int(out, 1);
+
+    } else if (argc == 2 && cmd_is(cmd[0], "ttl")) {
+        Entry *ent = store_find(cmd[1].data, cmd[1].len);
+        if (!ent) {
+            out_int(out, -2);   // real Redis convention: -2 = key doesn't exist
+            return;
+        }
+        if (ent->heap_idx == SIZE_MAX) {
+            out_int(out, -1);   // -1 = key exists but has no TTL
+            return;
+        }
+        uint64_t now_ms = get_monotonic_msec();
+        uint64_t expire_at = g_heap.data[ent->heap_idx].val;
+        int64_t remaining = (expire_at > now_ms) ? (int64_t)(expire_at - now_ms) : 0;
+        out_int(out, remaining);
+
+    } else if (argc == 2 && cmd_is(cmd[0], "persist")) {
+        Entry *ent = store_find(cmd[1].data, cmd[1].len);
+        if (!ent || ent->heap_idx == SIZE_MAX) {
+            out_int(out, 0);   // nothing to remove
+            return;
+        }
+        entry_set_ttl(ent, -1);
+        out_int(out, 1);
+
     } else if (argc == 4 && cmd_is(cmd[0], "zadd")) {
         // zadd key score name
         double score;
@@ -976,6 +1195,7 @@ static void do_request(Str *cmd, size_t argc, Buffer *out) {
             ent->key_len = cmd[1].len;
             ent->node.hcode = fnv1a_hash(cmd[1].data, cmd[1].len);
             ent->type = T_ZSET;
+            ent->heap_idx = SIZE_MAX;   // no TTL yet - same reasoning as store_set
             hm_insert(&g_db, &ent->node);
         } else if (ent->type != T_ZSET) {
             out_err(out, 2, "WRONGTYPE key holds a different kind of value");
@@ -1085,7 +1305,14 @@ typedef struct Conn {
     bool want_close;
     Buffer incoming;   // bytes read from the socket, not yet fully parsed
     Buffer outgoing;   // bytes generated by us, waiting to be written
+    uint64_t last_active_ms;   // for idle-connection timeout
+    DList idle_node;            // this connection's spot in the idle list
 } Conn;
+
+// Dummy head of the idle-connection list - see the DList comment above
+// for why a dummy node avoids special-casing an empty list. Initialized
+// in main() via dlist_init() before the event loop starts.
+static DList g_idle_list;
 
 // fd -> Conn* lookup table. On Linux, fds are allocated as the smallest
 // available non-negative integer, so a flat array indexed by fd is dense
@@ -1138,6 +1365,9 @@ static Conn *handle_accept(int listen_fd) {
     conn->want_read = true;    // we want to read their first request
     buf_init(&conn->incoming);
     buf_init(&conn->outgoing);
+
+    conn->last_active_ms = get_monotonic_msec();
+    dlist_insert_before(&g_idle_list, &conn->idle_node);
 
     printf("new connection, fd=%d\n", conn_fd);
     return conn;
@@ -1238,13 +1468,91 @@ static void handle_write(Conn *conn) {
 static void destroy_conn(Conn *conn) {
     close(conn->fd);
     g_fd2conn[conn->fd] = NULL;
+    dlist_detach(&conn->idle_node);   // remove from the idle-timeout list too
     buf_free(&conn->incoming);
     buf_free(&conn->outgoing);
     printf("closed connection, fd=%d\n", conn->fd);
     free(conn);
 }
 
+#ifndef K_IDLE_TIMEOUT_MS
+#define K_IDLE_TIMEOUT_MS 30000   // 30s - overridable at compile time for testing
+#endif
+
+// How long poll() should wait: either until a socket is ready, or until
+// the NEAREST timer (idle timeout or key TTL) is due, whichever is
+// sooner. This is why poll()'s timeout is no longer a hardcoded -1
+// (block forever) - a timer needs the loop to wake up even when nothing
+// on the network has happened.
+static int32_t next_timer_ms(void) {
+    uint64_t now_ms = get_monotonic_msec();
+    uint64_t next_ms = UINT64_MAX;
+
+    if (!dlist_empty(&g_idle_list)) {
+        Conn *conn = container_of(g_idle_list.next, Conn, idle_node);
+        next_ms = conn->last_active_ms + K_IDLE_TIMEOUT_MS;
+    }
+    if (g_heap.size > 0 && g_heap.data[0].val < next_ms) {
+        next_ms = g_heap.data[0].val;
+    }
+
+    if (next_ms == UINT64_MAX) {
+        return -1;   // no timers at all - poll() can block indefinitely
+    }
+    if (next_ms <= now_ms) {
+        return 0;    // already due - don't wait, handle it immediately
+    }
+    return (int32_t)(next_ms - now_ms);
+}
+
+// Called once per event loop iteration: close any connections that have
+// been idle too long, and delete any keys whose TTL has expired.
+static void process_timers(void) {
+    uint64_t now_ms = get_monotonic_msec();
+
+    // Idle connections are sorted by nature (see the DList comment
+    // earlier) - the front of the list is always the one waiting longest,
+    // so we just keep popping from the front until we hit one that's NOT
+    // expired yet.
+    while (!dlist_empty(&g_idle_list)) {
+        Conn *conn = container_of(g_idle_list.next, Conn, idle_node);
+        uint64_t deadline = conn->last_active_ms + K_IDLE_TIMEOUT_MS;
+        if (deadline >= now_ms) {
+            break;   // this one (and everyone after it) is still fine
+        }
+        fprintf(stderr, "idle timeout, closing fd=%d\n", conn->fd);
+        destroy_conn(conn);
+    }
+
+    // TTL expirations, capped per iteration - same "don't freeze the
+    // event loop" principle as progressive hashtable resizing. If a huge
+    // batch of keys expire at once, we'd rather spread that work across
+    // several loop iterations (interleaved with normal client IO) than
+    // stall every connected client while we delete them all in one go.
+    const size_t k_max_expirations_per_tick = 2000;
+    size_t nworks = 0;
+    while (g_heap.size > 0 && g_heap.data[0].val < now_ms
+           && nworks < k_max_expirations_per_tick) {
+        Entry *ent = container_of(g_heap.data[0].ref, Entry, heap_idx);
+
+        // Copy the key before calling store_del(): store_del() frees
+        // ent->key as part of deleting the entry, and relying on the
+        // exact internal ordering of store_del() to make passing
+        // ent->key directly "safe" would be a fragile assumption that
+        // could break silently if store_del() is ever refactored. A
+        // few bytes of copying is cheap insurance against that.
+        size_t klen = ent->key_len;
+        char *key_copy = malloc(klen);
+        memcpy(key_copy, ent->key, klen);
+        store_del((const uint8_t *)key_copy, klen);
+        free(key_copy);
+
+        nworks++;
+    }
+}
+
 int main(void) {
+    dlist_init(&g_idle_list);
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         die("socket()");
@@ -1308,9 +1616,10 @@ int main(void) {
         }
 
         // Step 2: THE only blocking call in this whole program. Waits
-        // until at least one socket in the list is ready, however many
-        // clients that might be.
-        int rv = poll(poll_args, (nfds_t)idx, -1);
+        // until at least one socket in the list is ready, OR until the
+        // nearest timer is due - whichever comes first.
+        int32_t timeout_ms = next_timer_ms();
+        int rv = poll(poll_args, (nfds_t)idx, timeout_ms);
         if (rv < 0) {
             free(poll_args);
             if (errno == EINTR) {
@@ -1339,6 +1648,13 @@ int main(void) {
                 continue;
             }
 
+            // Any activity resets this connection's idle clock - move it
+            // to the back of the line, since it's now the LEAST likely
+            // to be the next one to time out.
+            conn->last_active_ms = get_monotonic_msec();
+            dlist_detach(&conn->idle_node);
+            dlist_insert_before(&g_idle_list, &conn->idle_node);
+
             if (ready & POLLIN) {
                 handle_read(conn);
             }
@@ -1350,6 +1666,12 @@ int main(void) {
                 destroy_conn(conn);
             }
         }
+
+        // Step 5: handle any timers that came due - idle connections to
+        // close, keys to expire. Runs every iteration, not just when
+        // poll() timed out - a timer can become due at the same moment
+        // some unrelated socket activity woke us up anyway.
+        process_timers();
 
         free(poll_args);
     }
