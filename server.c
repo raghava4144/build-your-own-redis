@@ -257,15 +257,384 @@ static uint64_t fnv1a_hash(const uint8_t *data, size_t len) {
     return h;
 }
 
+// ---------------------------------------------------------------------
+// AVL tree (Commit 7): a height-balanced binary search tree.
+//
+// Why we need this in addition to the hashtable: a hashtable is great for
+// "give me the value for this exact key" (O(1)) but useless for "give me
+// everything in order" or "give me the item ranked 50th" - hashing
+// deliberately scrambles order. A sorted set needs BOTH: instant lookup
+// by name (hashtable, reused from Commit 5) AND a structure that keeps
+// everything sorted by score (this tree).
+//
+// "Balanced" matters: a plain binary search tree can degenerate into a
+// straight line (O(N) operations) if items arrive in sorted order. AVL
+// trees actively re-balance after every insert/delete so the height never
+// exceeds O(log N), guaranteeing fast operations even in the worst case.
+// ---------------------------------------------------------------------
+typedef struct AVLNode {
+    struct AVLNode *parent;
+    struct AVLNode *left;
+    struct AVLNode *right;
+    uint32_t height;   // height of this subtree, for balance checks
+    uint32_t cnt;       // size of this subtree, for O(log N) rank queries
+} AVLNode;
+
+static void avl_init(AVLNode *node) {
+    node->parent = node->left = node->right = NULL;
+    node->height = 1;
+    node->cnt = 1;
+}
+
+static uint32_t avl_height(AVLNode *node) { return node ? node->height : 0; }
+static uint32_t avl_cnt(AVLNode *node) { return node ? node->cnt : 0; }
+static uint32_t max_u32(uint32_t a, uint32_t b) { return a > b ? a : b; }
+
+// Recompute this node's height/count from its children. Must be called
+// bottom-up after any structural change - a node's stats depend on its
+// children's stats.
+static void avl_update(AVLNode *node) {
+    node->height = 1 + max_u32(avl_height(node->left), avl_height(node->right));
+    node->cnt = 1 + avl_cnt(node->left) + avl_cnt(node->right);
+}
+
+// Rotations: reshape a subtree to fix a height imbalance WITHOUT changing
+// the sorted order of the data. See the ASCII diagrams in the book if you
+// want to re-derive why this preserves order - the short version is that
+// only 2 parent/child links change, everything else's relative position
+// stays the same.
+static AVLNode *rot_left(AVLNode *node) {
+    AVLNode *parent = node->parent;
+    AVLNode *new_node = node->right;
+    AVLNode *inner = new_node->left;
+    node->right = inner;
+    if (inner) { inner->parent = node; }
+    new_node->parent = parent;
+    new_node->left = node;
+    node->parent = new_node;
+    avl_update(node);
+    avl_update(new_node);
+    return new_node;
+}
+
+static AVLNode *rot_right(AVLNode *node) {
+    AVLNode *parent = node->parent;
+    AVLNode *new_node = node->left;
+    AVLNode *inner = new_node->right;
+    node->left = inner;
+    if (inner) { inner->parent = node; }
+    new_node->parent = parent;
+    new_node->right = node;
+    node->parent = new_node;
+    avl_update(node);
+    avl_update(new_node);
+    return new_node;
+}
+
+// Fix a subtree where the LEFT side is too tall (by exactly 2 - that's
+// the only case that can happen from a single insert/delete).
+static AVLNode *avl_fix_left(AVLNode *node) {
+    if (avl_height(node->left->left) < avl_height(node->left->right)) {
+        node->left = rot_left(node->left);   // turn it into the simple case
+    }
+    return rot_right(node);
+}
+
+static AVLNode *avl_fix_right(AVLNode *node) {
+    if (avl_height(node->right->right) < avl_height(node->right->left)) {
+        node->right = rot_right(node->right);
+    }
+    return rot_left(node);
+}
+
+// Walk from a changed node up to the root, updating stats and fixing any
+// imbalance along the way. Returns the new root (rotations can change
+// which node is on top).
+static AVLNode *avl_fix(AVLNode *node) {
+    while (true) {
+        AVLNode **from = &node;
+        AVLNode *parent = node->parent;
+        if (parent) {
+            from = (parent->left == node) ? &parent->left : &parent->right;
+        }
+        avl_update(node);
+
+        uint32_t l = avl_height(node->left);
+        uint32_t r = avl_height(node->right);
+        if (l == r + 2) {
+            *from = avl_fix_left(node);
+        } else if (l + 2 == r) {
+            *from = avl_fix_right(node);
+        }
+
+        if (!parent) {
+            return *from;
+        }
+        node = parent;
+    }
+}
+
+// Detach a node that has 0 or 1 children (the "easy case" - the other
+// case, 2 children, works by swapping with a neighbor down to this case,
+// see avl_del below).
+static AVLNode *avl_del_easy(AVLNode *node) {
+    AVLNode *child = node->left ? node->left : node->right;
+    AVLNode *parent = node->parent;
+    if (child) {
+        child->parent = parent;
+    }
+    if (!parent) {
+        return child;   // we just removed the root
+    }
+    AVLNode **from = (parent->left == node) ? &parent->left : &parent->right;
+    *from = child;
+    return avl_fix(parent);
+}
+
+static AVLNode *avl_del(AVLNode *node) {
+    if (!node->left || !node->right) {
+        return avl_del_easy(node);
+    }
+    // 2 children: find the in-order successor (leftmost node in the right
+    // subtree), detach IT instead (always the easy case, since it has no
+    // left child by definition), then swap it into this node's position.
+    AVLNode *victim = node->right;
+    while (victim->left) {
+        victim = victim->left;
+    }
+    AVLNode *root = avl_del_easy(victim);
+
+    *victim = *node;    // copy links/stats - victim now stands in for node
+    if (victim->left) { victim->left->parent = victim; }
+    if (victim->right) { victim->right->parent = victim; }
+
+    AVLNode **from = &root;
+    AVLNode *parent = node->parent;
+    if (parent) {
+        from = (parent->left == node) ? &parent->left : &parent->right;
+    }
+    *from = victim;
+    return root;
+}
+
+// The payoff for maintaining `cnt` on every node: walk from `node` to
+// whatever is `offset` positions away IN SORTED ORDER, in O(log N) -
+// without this, "give me the next 20 items" would mean walking one at a
+// time (O(offset)), which is exactly the pagination problem SQL has.
+static AVLNode *avl_offset(AVLNode *node, int64_t offset) {
+    int64_t pos = 0;
+    while (offset != pos) {
+        if (pos < offset && pos + (int64_t)avl_cnt(node->right) >= offset) {
+            node = node->right;
+            pos += (int64_t)avl_cnt(node->left) + 1;
+        } else if (pos > offset && pos - (int64_t)avl_cnt(node->left) <= offset) {
+            node = node->left;
+            pos -= (int64_t)avl_cnt(node->right) + 1;
+        } else {
+            AVLNode *parent = node->parent;
+            if (!parent) {
+                return NULL;    // ran off the end of the tree
+            }
+            if (parent->right == node) {
+                pos -= (int64_t)avl_cnt(node->left) + 1;
+            } else {
+                pos += (int64_t)avl_cnt(node->right) + 1;
+            }
+            node = parent;
+        }
+    }
+    return node;
+}
+
+// ---------------------------------------------------------------------
+// ZSet: a sorted set of (score, name) pairs, indexed TWO ways at once -
+// by the AVL tree above (for sorted order and range/rank queries) and by
+// a hashtable (for instant point lookup by name, same HMap type we
+// already built). Both indexes point at the SAME node - this is the
+// "multi-indexed intrusive data structure" idea from the book: one
+// allocation, two structures running through it.
+// ---------------------------------------------------------------------
+typedef struct ZNode {
+    AVLNode tree;
+    HNode hmap;
+    double score;
+    size_t len;
+    char name[];    // flexible array member - the name's bytes live
+                     // directly after this struct, one allocation total
+} ZNode;
+
+typedef struct {
+    AVLNode *root;   // sorted by (score, name)
+    HMap hmap;        // indexed by name only
+} ZSet;
+
+static ZNode *znode_new(const char *name, size_t len, double score) {
+    ZNode *node = malloc(sizeof(ZNode) + len);
+    avl_init(&node->tree);
+    node->hmap.next = NULL;
+    node->hmap.hcode = fnv1a_hash((const uint8_t *)name, len);
+    node->score = score;
+    node->len = len;
+    memcpy(node->name, name, len);
+    return node;
+}
+
+// A throwaway struct for hashtable lookups by name - same trick as
+// store_find()'s lookup_key: points at the caller's bytes, never inserted.
+typedef struct {
+    HNode node;
+    const char *name;
+    size_t len;
+} HKey;
+
+static bool hkey_eq(HNode *lhs, HNode *rhs) {
+    ZNode *znode = container_of(lhs, ZNode, hmap);
+    HKey *hkey = container_of(rhs, HKey, node);
+    return znode->len == hkey->len
+        && memcmp(znode->name, hkey->name, znode->len) == 0;
+}
+
+static ZNode *zset_lookup(ZSet *zset, const char *name, size_t len) {
+    HKey key;
+    key.node.hcode = fnv1a_hash((const uint8_t *)name, len);
+    key.name = name;
+    key.len = len;
+    HNode *found = hm_lookup(&zset->hmap, &key.node, &hkey_eq);
+    return found ? container_of(found, ZNode, hmap) : NULL;
+}
+
+// Tuple comparison: order by score first, name as a tiebreak. This is
+// what makes "sorted set" meaningful when scores collide.
+static bool zless(AVLNode *lhs, AVLNode *rhs) {
+    ZNode *zl = container_of(lhs, ZNode, tree);
+    ZNode *zr = container_of(rhs, ZNode, tree);
+    if (zl->score != zr->score) {
+        return zl->score < zr->score;
+    }
+    size_t minlen = zl->len < zr->len ? zl->len : zr->len;
+    int rv = memcmp(zl->name, zr->name, minlen);
+    if (rv != 0) {
+        return rv < 0;
+    }
+    return zl->len < zr->len;
+}
+
+// Same comparison, but against an explicit (score, name) instead of
+// another tree node - used by zset_seekge() to find where a query starts.
+static bool zless_key(AVLNode *node, double score, const char *name, size_t len) {
+    ZNode *zn = container_of(node, ZNode, tree);
+    if (zn->score != score) {
+        return zn->score < score;
+    }
+    size_t minlen = zn->len < len ? zn->len : len;
+    int rv = memcmp(zn->name, name, minlen);
+    if (rv != 0) {
+        return rv < 0;
+    }
+    return zn->len < len;
+}
+
+static void tree_insert(ZSet *zset, ZNode *node) {
+    AVLNode *parent = NULL;
+    AVLNode **from = &zset->root;
+    while (*from) {
+        parent = *from;
+        from = zless(&node->tree, parent) ? &parent->left : &parent->right;
+    }
+    *from = &node->tree;
+    node->tree.parent = parent;
+    zset->root = avl_fix(&node->tree);
+}
+
+static void zset_update(ZSet *zset, ZNode *node, double score) {
+    if (node->score == score) {
+        return;   // no change - skip the detach/reinsert entirely
+    }
+    zset->root = avl_del(&node->tree);
+    avl_init(&node->tree);
+    node->score = score;
+    tree_insert(zset, node);
+}
+
+// Insert a new (score, name) pair, or update the score if that name
+// already exists. Returns true if this created a brand new pair.
+static bool zset_insert(ZSet *zset, const char *name, size_t len, double score) {
+    ZNode *existing = zset_lookup(zset, name, len);
+    if (existing) {
+        zset_update(zset, existing, score);
+        return false;
+    }
+    ZNode *node = znode_new(name, len, score);
+    hm_insert(&zset->hmap, &node->hmap);
+    tree_insert(zset, node);
+    return true;
+}
+
+static void zset_delete(ZSet *zset, ZNode *node) {
+    HKey key;
+    key.node.hcode = node->hmap.hcode;
+    key.name = node->name;
+    key.len = node->len;
+    hm_delete(&zset->hmap, &key.node, &hkey_eq);
+    zset->root = avl_del(&node->tree);
+    free(node);
+}
+
+// Find the first pair >= (score, name) in sorted order - the starting
+// point for a range query.
+static ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len) {
+    AVLNode *found = NULL;
+    AVLNode *node = zset->root;
+    while (node) {
+        if (zless_key(node, score, name, len)) {
+            node = node->right;
+        } else {
+            found = node;   // candidate - keep looking for something closer
+            node = node->left;
+        }
+    }
+    return found ? container_of(found, ZNode, tree) : NULL;
+}
+
+static ZNode *znode_offset(ZNode *node, int64_t offset) {
+    AVLNode *tnode = node ? avl_offset(&node->tree, offset) : NULL;
+    return tnode ? container_of(tnode, ZNode, tree) : NULL;
+}
+
+// Free every pair in a zset. Used when a key holding a zset gets deleted
+// or overwritten with SET. Relies on hm_foreach() below being safe to use
+// with a callback that frees its argument - see the h_scan fix that goes
+// along with this commit.
+static void zset_free_cb(HNode *node, void *arg) {
+    (void)arg;
+    ZNode *znode = container_of(node, ZNode, hmap);
+    free(znode);
+}
+
+static void zset_clear(ZSet *zset);   // forward-declared, defined after hm_foreach below
+
 // Entry: our actual key/value pair, with an HNode embedded directly in
 // it (the intrusive part). There's no separate list-node allocation -
 // the hashtable's linked list literally runs through these structs.
+//
+// A key can now hold EITHER a plain string OR a sorted set - `type`
+// says which, and only the matching fields are meaningful. Keeping both
+// sets of fields unconditionally (rather than a C union) costs a little
+// extra memory per entry but keeps the code simple - a deliberate
+// trade-off, not an oversight.
+enum {
+    T_STR = 1,
+    T_ZSET = 2,
+};
+
 typedef struct {
     HNode node;
     char *key;
     size_t key_len;
-    char *val;
+    uint32_t type;
+    char *val;          // meaningful when type == T_STR
     size_t val_len;
+    ZSet zset;           // meaningful when type == T_ZSET
 } Entry;
 
 static HMap g_db;   // zero-initialized by default (static storage)
@@ -297,9 +666,15 @@ static int store_set(const uint8_t *key, size_t key_len,
                       const uint8_t *val, size_t val_len) {
     Entry *ent = store_find(key, key_len);
     if (ent) {
-        free(ent->val);     // overwriting - release the old value
+        // SET always overwrites, regardless of what type was there before
+        // (same behavior as real Redis) - free whatever the old value was.
+        if (ent->type == T_ZSET) {
+            zset_clear(&ent->zset);
+        } else {
+            free(ent->val);
+        }
     } else {
-        ent = malloc(sizeof(Entry));
+        ent = calloc(1, sizeof(Entry));   // zeroed - zset fields start clean
         ent->key = malloc(key_len);
         memcpy(ent->key, key, key_len);
         ent->key_len = key_len;
@@ -307,6 +682,7 @@ static int store_set(const uint8_t *key, size_t key_len,
         ent->node.next = NULL;
         hm_insert(&g_db, &ent->node);
     }
+    ent->type = T_STR;
     ent->val = malloc(val_len);
     memcpy(ent->val, val, val_len);
     ent->val_len = val_len;
@@ -326,7 +702,11 @@ static bool store_del(const uint8_t *key, size_t key_len) {
     }
     Entry *ent = container_of(node, Entry, node);
     free(ent->key);
-    free(ent->val);
+    if (ent->type == T_ZSET) {
+        zset_clear(&ent->zset);
+    } else {
+        free(ent->val);
+    }
     free(ent);
     return true;
 }
@@ -399,7 +779,8 @@ enum {
     TAG_ERR = 1,    // an error code + message
     TAG_STR = 2,    // a length-prefixed string
     TAG_INT = 3,    // a 64-bit integer
-    TAG_ARR = 4,    // a count, followed by that many tagged values
+    TAG_DBL = 4,    // a double - added this commit, for ZSCORE
+    TAG_ARR = 5,    // a count, followed by that many tagged values
 };
 
 static void out_nil(Buffer *out) {
@@ -417,6 +798,12 @@ static void out_str(Buffer *out, const char *s, size_t len) {
 
 static void out_int(Buffer *out, int64_t val) {
     uint8_t tag = TAG_INT;
+    buf_append(out, &tag, 1);
+    buf_append(out, (const uint8_t *)&val, 8);
+}
+
+static void out_dbl(Buffer *out, double val) {
+    uint8_t tag = TAG_DBL;
     buf_append(out, &tag, 1);
     buf_append(out, (const uint8_t *)&val, 8);
 }
@@ -440,6 +827,51 @@ static void out_arr(Buffer *out, uint32_t n) {
     buf_append(out, (const uint8_t *)&n, 4);
 }
 
+// arr_begin/arr_end: same "reserve now, patch later" trick as
+// response_begin/response_end, but for an array's count specifically.
+// Needed for zquery, where we don't know how many results there'll be
+// until we've actually walked the tree and hit the limit or run out.
+static size_t arr_begin(Buffer *out) {
+    uint8_t tag = TAG_ARR;
+    buf_append(out, &tag, 1);
+    size_t pos = out->size;
+    uint32_t placeholder = 0;
+    buf_append(out, (const uint8_t *)&placeholder, 4);
+    return pos;
+}
+
+static void arr_end(Buffer *out, size_t pos, uint32_t n) {
+    memcpy(out->data + pos, &n, 4);
+}
+
+// Parse a length-prefixed string argument as a number. Copies into a
+// small stack buffer first since strtod/strtoll need a NUL-terminated
+// C string, and our Str type is just a pointer + length (not terminated).
+static bool parse_double(Str s, double *out) {
+    if (s.len >= 63) {
+        return false;
+    }
+    char buf[64];
+    memcpy(buf, s.data, s.len);
+    buf[s.len] = '\0';
+    char *end = NULL;
+    *out = strtod(buf, &end);
+    return end != buf && *end == '\0';
+}
+
+static bool parse_int(Str s, int64_t *out) {
+    if (s.len >= 63) {
+        return false;
+    }
+    char buf[64];
+    memcpy(buf, s.data, s.len);
+    buf[s.len] = '\0';
+    char *end = NULL;
+    *out = strtoll(buf, &end, 10);
+    return end != buf && *end == '\0';
+}
+
+
 // ---------------------------------------------------------------------
 // hm_foreach: walk every key in the hashtable, calling `cb` on each one.
 // Needed for the new `keys` command below - this is the first time we
@@ -452,8 +884,16 @@ static void h_scan(HTab *tab, HScanCb cb, void *arg) {
         return;
     }
     for (size_t i = 0; i <= tab->mask; i++) {
-        for (HNode *node = tab->tab[i]; node != NULL; node = node->next) {
+        HNode *node = tab->tab[i];
+        while (node) {
+            // Capture `next` BEFORE calling cb(). Commit 6's version read
+            // node->next as part of the for-loop's increment step, which
+            // runs AFTER cb() - fine for a callback that only reads the
+            // node (like cb_keys), but a use-after-free waiting to happen
+            // for one that frees it (like zset_free_cb, added this commit).
+            HNode *next = node->next;
             cb(node, arg);
+            node = next;
         }
     }
 }
@@ -468,6 +908,16 @@ static void hm_foreach(HMap *hmap, HScanCb cb, void *arg) {
 
 static size_t hm_size(HMap *hmap) {
     return hmap->newer.size + hmap->older.size;
+}
+
+// (Defined here, not up near zset_free_cb, because it needs hm_foreach.)
+static void zset_clear(ZSet *zset) {
+    hm_foreach(&zset->hmap, &zset_free_cb, NULL);
+    free(zset->hmap.newer.tab);
+    free(zset->hmap.older.tab);
+    zset->hmap.newer = (HTab){0};
+    zset->hmap.older = (HTab){0};
+    zset->root = NULL;
 }
 
 static bool cmd_is(Str s, const char *literal) {
@@ -493,6 +943,10 @@ static void do_request(Str *cmd, size_t argc, Buffer *out) {
             out_nil(out);
             return;
         }
+        if (ent->type != T_STR) {
+            out_err(out, 2, "WRONGTYPE key holds a different kind of value");
+            return;
+        }
         out_str(out, ent->val, ent->val_len);
 
     } else if (argc == 3 && cmd_is(cmd[0], "set")) {
@@ -506,6 +960,89 @@ static void do_request(Str *cmd, size_t argc, Buffer *out) {
     } else if (argc == 1 && cmd_is(cmd[0], "keys")) {
         out_arr(out, (uint32_t)hm_size(&g_db));
         hm_foreach(&g_db, &cb_keys, out);
+
+    } else if (argc == 4 && cmd_is(cmd[0], "zadd")) {
+        // zadd key score name
+        double score;
+        if (!parse_double(cmd[2], &score)) {
+            out_err(out, 1, "expected a valid number for score");
+            return;
+        }
+        Entry *ent = store_find(cmd[1].data, cmd[1].len);
+        if (!ent) {
+            ent = calloc(1, sizeof(Entry));
+            ent->key = malloc(cmd[1].len);
+            memcpy(ent->key, cmd[1].data, cmd[1].len);
+            ent->key_len = cmd[1].len;
+            ent->node.hcode = fnv1a_hash(cmd[1].data, cmd[1].len);
+            ent->type = T_ZSET;
+            hm_insert(&g_db, &ent->node);
+        } else if (ent->type != T_ZSET) {
+            out_err(out, 2, "WRONGTYPE key holds a different kind of value");
+            return;
+        }
+        bool added = zset_insert(&ent->zset, (const char *)cmd[3].data, cmd[3].len, score);
+        out_int(out, added ? 1 : 0);
+
+    } else if (argc == 3 && cmd_is(cmd[0], "zscore")) {
+        Entry *ent = store_find(cmd[1].data, cmd[1].len);
+        if (!ent || ent->type != T_ZSET) {
+            out_nil(out);
+            return;
+        }
+        ZNode *znode = zset_lookup(&ent->zset, (const char *)cmd[2].data, cmd[2].len);
+        if (!znode) {
+            out_nil(out);
+            return;
+        }
+        out_dbl(out, znode->score);
+
+    } else if (argc == 3 && cmd_is(cmd[0], "zrem")) {
+        Entry *ent = store_find(cmd[1].data, cmd[1].len);
+        if (!ent || ent->type != T_ZSET) {
+            out_int(out, 0);
+            return;
+        }
+        ZNode *znode = zset_lookup(&ent->zset, (const char *)cmd[2].data, cmd[2].len);
+        if (!znode) {
+            out_int(out, 0);
+            return;
+        }
+        zset_delete(&ent->zset, znode);
+        out_int(out, 1);
+
+    } else if (argc == 6 && cmd_is(cmd[0], "zquery")) {
+        // zquery key score name offset limit
+        // Returns pairs >= (score, name) in sorted order, skipping the
+        // first `offset` of them, up to `limit` pairs total.
+        double score;
+        int64_t offset = 0, limit = 0;
+        if (!parse_double(cmd[2], &score)
+            || !parse_int(cmd[4], &offset)
+            || !parse_int(cmd[5], &limit)) {
+            out_err(out, 1, "invalid score/offset/limit");
+            return;
+        }
+        Entry *ent = store_find(cmd[1].data, cmd[1].len);
+        if (!ent || ent->type != T_ZSET) {
+            out_arr(out, 0);
+            return;
+        }
+
+        ZNode *znode = zset_seekge(&ent->zset, score, (const char *)cmd[3].data, cmd[3].len);
+        znode = znode_offset(znode, offset);
+
+        size_t hdr = arr_begin(out);
+        uint32_t n = 0;
+        int64_t pairs = 0;
+        while (znode && pairs < limit) {
+            out_str(out, znode->name, znode->len);
+            out_dbl(out, znode->score);
+            znode = znode_offset(znode, 1);
+            n += 2;   // each pair contributes 2 array entries: name, score
+            pairs++;
+        }
+        arr_end(out, hdr, n);
 
     } else {
         out_err(out, 1, "unrecognized command or wrong number of arguments");

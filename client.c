@@ -62,7 +62,8 @@ enum {
     TAG_ERR = 1,
     TAG_STR = 2,
     TAG_INT = 3,
-    TAG_ARR = 4,
+    TAG_DBL = 4,    // added this commit, for ZSCORE
+    TAG_ARR = 5,    // renumbered from 4 - a real "protocol version bump"
 };
 
 // Parse and print ONE tagged value starting at `cur`. Returns a pointer
@@ -122,6 +123,17 @@ static const uint8_t *print_one(const uint8_t *cur, const uint8_t *end, int inde
         int64_t val = 0;
         memcpy(&val, cur, 8); cur += 8;
         printf("(integer) %lld\n", (long long)val);
+        break;
+    }
+
+    case TAG_DBL: {
+        if (cur + 8 > end) {
+            printf("(truncated response)\n");
+            return end;
+        }
+        double val = 0;
+        memcpy(&val, cur, 8); cur += 8;
+        printf("(double) %g\n", val);
         break;
     }
 
@@ -208,6 +220,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "       %s get name\n", argv[0]);
         fprintf(stderr, "       %s del name\n", argv[0]);
         fprintf(stderr, "       %s keys\n", argv[0]);
+        fprintf(stderr, "       %s zadd leaderboard 100 alice\n", argv[0]);
+        fprintf(stderr, "       %s zscore leaderboard alice\n", argv[0]);
+        fprintf(stderr, "       %s zrem leaderboard alice\n", argv[0]);
+        fprintf(stderr, "       %s zquery leaderboard 0 \"\" 0 10\n", argv[0]);
         return 1;
     }
 
